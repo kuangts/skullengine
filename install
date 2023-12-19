@@ -1,0 +1,265 @@
+#!/bin/bash -l
+
+# installs skullengine for specified user at specified path
+
+# this script is intended for bash/apt
+# specifically, it writes to ~/.bashrc, and downloads python/nvidia-drivers with apt if necessary
+# modification is likely required for other shells/distros
+# to install for another user or add new user, sudo priviledge is required
+
+# usage:
+#   `install --adduser --user <user> --path <path>`
+
+# if --adduser, new user in the name of <user> will be added if it does not exist
+# otherwise, <user> must exist
+
+# <user> defaults to the current user if not specified
+# <path> defaults to /home/<user>/path if not specified
+
+# be careful when specifying <path>:
+#   if intended user is not the current user, it is much safer to use absolute path
+#   if new user is created, <path> must exist after <user> is created
+
+
+sh_login=''
+skullengine_repo='https://github.com/kuangts/skullengine'
+
+#------------------ parse args ------------------#
+
+
+# https://stackoverflow.com/questions/192249/how-do-i-parse-command-line-arguments-in-bash?page=1&tab=scoredesc#tab-top
+! getopt --test > /dev/null 
+if [[ ${PIPESTATUS[0]} -ne 4 ]]; then
+    echo '`getopt --test` failed in this environment.'
+    exit 1
+fi
+LONGOPTS=adduser,user:,path:
+OPTIONS=au:p:
+! PARSED=$(getopt --options=$OPTIONS --longoptions=$LONGOPTS --name "$0" -- "$@")
+if [[ ${PIPESTATUS[0]} -ne 0 ]]; then
+    exit 2
+fi
+eval set -- "$PARSED"
+adduser=n user=$(whoami) path=''
+while true; do
+    case "$1" in
+        -a|--adduser)
+            adduser=y
+            shift
+            ;;
+        -u|--user)
+            user="${2#*=}"
+            shift 2
+            ;;
+        -p|--path)
+            path="${2#*=}"
+            shift 2
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            echo "wrong input"
+            exit 3
+            ;;
+    esac
+done
+    
+echo "$0, adduser:$adduser, user: $user, path: $path"
+exit 0
+
+
+#------------------ user setup ------------------#
+
+# following skullengine-addkey function will be written to the new user's login script
+read -r -d '' addkey <<'EOF'
+
+# [start] SKULLENGINE skullengine-addkey
+skullengine-addkey () {
+
+    # $1 - directory where key will be saved or current directory if none given
+
+    d=$(date +"%Y-%m-%d-%H-%M-%S.%N")
+    loc="$realpath(${1:-"."}/$d.pem)"
+    (
+        set -e
+        ssh-keygen -N '' -C $d -f "$loc"
+        sudo -H --user=$user -s /bin/bash -c "mkdir ~/.ssh >/dev/null 2>&1; cat '$loc.pub' >> ~/.ssh/authorized_keys"
+        rm "$loc.pub"
+        echo "New (private) key saved at '$loc'"
+    )
+    if test $? != 0 ; then 
+        rm "$loc" "$loc.pub" > /dev/null 2>&1
+        echo 'Key generation failed'
+        return 1
+    fi
+}
+# [end] SKULLENGINE skullengine-addkey
+
+EOF
+
+if test $adduser = y ; then
+
+    # create new user if necessary
+
+    if id $user >/dev/null 2>&1; then
+        echo "User '$user' exists"
+    else
+        # if we create a new user with passwordless option
+        # the newly created user must generate access keys
+        # otherwise, with existing users, access control is up to them
+
+        (
+            set -e
+            sudo adduser --disabled-password --gecos '' $user > /dev/null
+            # source skullengine-addkey to current process
+            source <(echo "$addkey")
+            # execute to get the new key, and if all goes well, write the same function to login script
+            skullengine-addkey . && sudo /bin/bash -c "echo '$addkey' >> '/home/$user/.bashrc'"
+        )
+        if test $? = 0; then
+            echo "User '$user' created"
+        else
+            sudo userdel -rf $user > /dev/null 2>&1
+            echo "Failed to create user '$user'"
+            exit 1
+        fi
+    fi
+else
+    if ! id $user >/dev/null 2>&1; then
+        echo "User $user does not exist"
+        exit 1
+    fi
+fi
+
+
+#------------------ install skullengine ------------------#
+
+if test $(whoami) != $user; then
+    # run this script as the intended user
+    sudo -H -u $user /bin/bash "$0" --path "$path"
+    exit 0
+
+else
+    if test -z $path ; then
+        path=/home/$user/skullengine
+    fi
+    path="$(realpath $path)"
+
+    # if directory exists already at the target location
+    # then assume it is skullengine repository
+    # else clone repository from Github
+
+    # if python is not installed, try installing using apt-get
+    # python installation requires sudo privilege
+
+
+    # find a python binary (>=3.9)
+    py_bin=''
+    for v in $(seq 12 -1 9) ; do
+        if which "python3.$v" > /dev/null ; then
+            py_bin="python3.$v"
+            break
+        fi
+    done
+
+    if test -z $py_bin ; then
+        # try to install python
+        echo "Python (>=3.9) is not found; Installing python 3.12 ..."
+        (
+            sudo apt-get update && sudo apt-get install python3.12
+        )
+        if test $? != 0 ; then 
+            (
+                set -e
+                sudo apt-get install software-properties-common
+                sudo add-apt-repository ppa:deadsnakes/ppa
+                sudo apt-get update
+                sudo apt-get install python3.12
+            )
+        fi
+        if test $? != 0 ; then
+            echo "Python installation failed, exit"
+            exit 1
+        fi
+    fi
+
+
+    # download repo if it does not exist
+    # but most likely, this script is found inside the existing repo
+    if ! test -d "$path" ; then
+        echo "Cloning skullengine to $path"
+        git clone $skullengine_repo "$path"
+        if test $? != 0 ; then
+            rm -rf "$path" > /dev/null 2>&1
+            echo "Cannot clone skullengine.git to $path"
+            exit 1
+        fi
+    fi
+
+    # update repository
+    if test $repo = $(git config -f "$path/.git/config" --get remote.origin.url) ; then
+        echo "Updating repository at $path"
+        git --work-tree="$path" --git-dir="$path/.git" pull \
+            || echo "Cannot update repository at $path, trying to continue installation ..."
+    else
+        echo "Wrong repository; \`rm -rf $path\` to continue installation, exit"
+        exit 1
+    fi
+
+    # create virtual environment
+    if test -d "$path/.venv"; then
+        echo "Environment exists at $path/.venv"
+    else
+        echo "Creating environment at $path/.venv"
+        $py_bin -m venv "$path/.venv"
+        if test $? != 0 ; then
+            rm -rf "$path/.venv" > /dev/null 2>&1
+            echo "Cannot create environment at $path/.venv"
+            exit 1
+        fi
+    fi
+
+    # install python packages
+    echo "Installing python packages"
+    (
+        set -e
+        source "$path/.venv/bin/activate" 
+        python -m pip install -r "$path/requirements.txt"
+        deactivate
+    )
+    if test $? != 0 ; then 
+        echo "Failed to install python packages"
+        exit 1
+    fi
+
+fi
+
+# successfully installed skullengine
+# now, add skullengine function to login script
+# so that we can use `skullengine ...` upon login
+
+read -r -d '' engine <<EOF
+
+# [start] SKULLENGINE skullengine
+export SKULLENGINE_ROOT='$path'
+skullengine() {
+    if test -d \$SKULLENGINE_ROOT; then
+        source "\$SKULLENGINE_ROOT/.venv/bin/activate"
+        python "\$SKULLENGINE_ROOT/main.py" \$@ 
+        deactivate
+    else
+        echo "skullengine is not installed"
+    fi
+}
+# [end] SKULLENGINE skullengine
+
+EOF
+
+sudo /bin/bash -c "echo '$engine' >> '/home/$user/.bashrc'"
+
+
+skullengine-echo () {
+    echo skullengine $(whoami) $user
+}
