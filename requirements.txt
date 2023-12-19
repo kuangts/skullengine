@@ -1,6 +1,2 @@
 numpy
-torch
-SimpleITK
-pandas
 easydict
-vtk
